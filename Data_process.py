@@ -1,17 +1,54 @@
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
+import xgboost as xgb
+from xgboost.sklearn import XGBClassifier
+from matplotlib.pylab import rcParams
 import numpy as np
+import random
 import seaborn as sns
+import sklearn
 from sklearn import preprocessing
+import sklearn.ensemble
 from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Lasso, Ridge #, ridge_regression
+from sklearn.model_selection import GridSearchCV
 from scipy import stats
 import math
 from collections import Counter
 import scipy.stats as ss
 
+np.random.seed(0)
+random.seed(0)
 
 '''Functions'''
+
+def modelfit(alg, train, target, useTrainCV=True, cv_folds=5, early_stopping_rounds=50):
+    
+    if useTrainCV:
+        xgb_param = alg.get_xgb_params()
+        xgtrain = xgb.DMatrix(train.values, label=target.values)
+        cvresult = xgb.cv(xgb_param, xgtrain, num_boost_round=alg.get_params()['n_estimators'], nfold=cv_folds,
+            metrics='rmse', early_stopping_rounds=early_stopping_rounds, seed = 0, verbose_eval = 5)
+        alg.set_params(n_estimators=cvresult.shape[0])
+        print(cvresult.shape[0])
+        print(cvresult)
+    #Fit the algorithm on the data
+    alg.fit(train, target, eval_metric='rmse')
+        
+    #Predict training set:
+    dtrain_predictions = alg.predict(train)
+    
+    #Print model report:
+    print("\nModel Report")
+    print("MSE : %.4g" % sklearn.metrics.mean_squared_error(target.values, dtrain_predictions))
+    
+    feat_imp = pd.Series(alg.get_booster().get_fscore()).sort_values(ascending=False)
+    feat_imp.plot(kind='bar', title='Feature Importances')
+    plt.ylabel('Feature Importance Score')
+    plt.show()
+
 def missing_replace(col_list, value_list):
     '''Function to find values in a dataframe that are missing for one or more feature, replaces them with a specific value. Id column sould NOT be passed.'''
     if 'Id' in col_list:
@@ -67,12 +104,14 @@ def cat_median_replace(list_var, spec_val):
     
     return train_data
 
-
+pd.set_option('mode.chained_assignment', None)
+pd.options.display.max_columns = None
 
 train = pd.read_csv('train.csv')
 test = pd.read_csv('test.csv')
 test['SalePrice'] =  'NA'
 train_data = pd.concat([train, test], ignore_index=True)
+test_labels = test['Id']
 
 '''Maps- for ordinal label encoding'''
 Qualities = {'None': 0, 'Po':1, 'Fa': 2, 'TA': 3, 'Gd':4, 'Ex':5}
@@ -86,6 +125,10 @@ central  = {'N':0, 'Y':1}
 slope = {'Sev':0, 'Mod':1, 'Gtl':2}
 streets = {'Grvl':0, 'Pave':1}
 pave = {'N':0, 'P':1, 'Y':2}
+
+'''Outliers'''
+train_data.at[(2592), 'GarageYrBlt'] = 2007
+train_data.drop([523, 1298], axis = 0, inplace = True)
 
 '''Garage'''
 train_data['GarageQual'] = train_data['GarageQual'].map(Qualities)
@@ -197,10 +240,77 @@ for col in ('Alley','FireplaceQu','Fence','MiscFeature'):
 #print("Skewness: %f" % train_data['SalePrice'].skew())
 #print("Kurtosis: %f" % train_data['SalePrice'].kurt())
 
-#print(train_data.loc[(train_data['PoolQC'] =='None') & (train_data['PoolArea'] > 0)])
+'''Feature engineering - New variables'''
+train_data['TotalBath'] = train_data['FullBath'] + train_data['BsmtFullBath'] + (0.5*train_data['HalfBath']) +(0.5* train_data['BsmtHalfBath'])
 
-'''Label Encoding'''
+train_data['Remodeled'] = ''
+for i in train_data['Id']:
+    if train_data.at[(i-1),'YearBuilt'] == train_data.at[(i-1), 'YearRemodAdd']:
+        train_data.at[(i-1) ,'Remodeled'] = 1
+    else:
+        train_data.at[(i-1) ,'Remodeled'] = 0
 
+train_data['Age'] = train_data['YrSold'] - train_data['YearRemodAdd']
+
+train_data['IsNew'] = ''
+for i in train_data['Id']:
+    if (train_data.at[(i-1),'YrSold'] - train_data.at[(i-1), 'YearBuilt'])< 5:
+        train_data.at[(i-1) ,'IsNew'] = 1
+    else:
+        train_data.at[(i-1) ,'IsNew'] = 0
+
+train_data['TotalSF'] = train_data['GrLivArea'] + train_data['TotalBsmtSF']
+train_data['TotalPorchSF'] = train_data['3SsnPorch'] + train_data['OpenPorchSF'] + train_data['EnclosedPorch'] + train_data['ScreenPorch'] 
+train_data['GrLivArea'] = train_data['1stFlrSF'] + train_data['2ndFlrSF'] + train_data['LowQualFinSF']
+train_data['TotalBsmtSF'] = train_data['BsmtFinSF1'] + train_data['BsmtFinSF2'] + train_data['BsmtUnfSF']
+
+'''Feature engineering - Binning variables'''
+train_data['NeighRich'] = ''
+for i in train_data['Id']:
+    if train_data.at[(i-1),'Neighborhood'] in ('StoneBr', 'NridgHt', 'NoRidge'):
+        train_data.at[(i-1), 'NeighRich'] = 3
+        
+    elif train_data.at[(i-1),'Neighborhood'] in ('SawyerW', 'NWAmes', 'Gilbert', 'Blmngtn', 'CollgCr', 'Crawfor','ClearCr', 'Somerst', 'Veenker', 'Timber' ):
+        train_data.at[(i-1), 'NeighRich'] = 2
+
+    elif train_data.at[(i-1),'Neighborhood'] in ('BrkSide','Edwards','Old Town', 'Sawyer', 'Blueste', 'SWISU', 'NPkVill', 'NAmes', 'Mitchel'):
+        train_data.at[(i-1), 'NeighRich'] = 1
+
+    else:
+        train_data.at[(i-1), 'NeighRich'] = 0
+'''First drop of variables'''
+first_feat_drop = ['FullBath', 'BsmtFullBath', 'HalfBath', 'BsmtHalfBath', 'YearRemodAdd']
+
+#For features I might add back in that will likely increase prediction power.
+contro_first_drop = ['YrSold', 'YearBuilt', '2ndFlrSF', 'LowQualFinSF', 'BsmtFinSF2', 'BsmtUnfSF', '3SsnPorch', 'OpenPorchSF', 'EnclosedPorch', 'ScreenPorch', 'Neighborhood']
+#Now drop highly correlated features:
+high_corr = ['GarageCond', 'GarageArea', 'GarageYrBlt', 'TotRmsAbvGrd']
+
+#Create target variables:
+Y = pd.to_numeric(train_data['SalePrice'][0:1458], errors = 'raise')
+target = ['SalePrice', 'Id']
+
+train_data.drop(first_feat_drop + contro_first_drop + high_corr + target , axis = 1, inplace = True)
+
+'''
+df_test_corr =  train_data.drop('SalePrice', axis = 1).corr().abs().unstack().sort_values(kind="quicksort", ascending=False).reset_index()
+df_test_corr.rename(columns={"level_0": "Feature 1", "level_1": "Feature 2", 0: 'Correlation Coefficient'}, inplace=True)
+df_test_corr.drop(df_test_corr.iloc[1::2].index, inplace=True)
+df_test_corr_nd = df_test_corr.drop(df_test_corr[df_test_corr['Correlation Coefficient'] == 1.0].index)
+
+corr = df_test_corr_nd['Correlation Coefficient'] > 0.5
+print(df_test_corr_nd[corr])
+'''
+
+'''Pre-process the data'''
+#List the continuous features:
+cont_feats = ['LotFrontage', 'LotArea', 'MasVnrArea', 'BsmtFinSF1', 'TotalBsmtSF', '1stFlrSF', 'GrLivArea', 'WoodDeckSF', 'PoolArea', 'MiscVal', 'Age', 'TotalSF', 'TotalPorchSF']
+#List all the ordinal categorical variables:
+ord_feats = ['Street', 'LotShape', 'LandSlope', 'OverallQual', 'OverallCond','MasVnrType','ExterQual', 'ExterCond','BsmtQual','BsmtCond', 'BsmtExposure', 'BsmtFinType1', 'BsmtFinType2', 'HeatingQC', 'CentralAir', 'BedroomAbvGr', 'KitchenAbvGr', 'KitchenQual', 'Functional', 'Fireplaces', 'FireplaceQu', 'GarageFinish', 'GarageCars', 'GarageQual', 'PavedDrive', 'PoolQC', 'TotalBath', 'Remodeled', 'IsNew', 'NeighRich']
+#List of all the OHE categorical variables:
+OHE_feats = ['MSSubClass', 'MSZoning', 'Alley', 'LandContour', 'LotConfig', 'Condition1', 'Condition2', 'BldgType', 'HouseStyle', 'RoofStyle', 'RoofMatl', 'Exterior1st', 'Exterior2nd', 'Foundation', 'Electrical', 'Heating', 'GarageType', 'Fence', 'MiscFeature', 'MoSold', 'SaleType', 'SaleCondition']
+
+#Now standadize the features in the ordinal and continuous features
 train_data['PoolQC'] = train_data['PoolQC'].map(Qualities)
 train_data['FireplaceQu'] = train_data['FireplaceQu'].map(Qualities)
 train_data['LotShape'] = train_data['LotShape'].map(LotShape_map)
@@ -220,21 +330,229 @@ train_data['LandSlope'] = train_data['LandSlope'].map(slope)
 train_data['Street'] = train_data['Street'].map(streets)
 train_data['PavedDrive'] = train_data['PavedDrive'].map(pave)
 
-'''One-hot encoding'''
-TRAIN = train_data[0:1460]
-TEST = train_data[1460:]
+TRAIN = train_data[0:1458]
+TRAIN = TRAIN.reset_index(drop = True)
+TEST = train_data[1458:]
 
-X_train_cat = TRAIN.select_dtypes(exclude =['int','float']).drop('SalePrice',axis = 1)
-Y_train_cat = TEST.select_dtypes(exclude =['int','float']).drop('SalePrice',axis = 1)
+scaler = StandardScaler()
 
+TRAIN[cont_feats] = scaler.fit_transform(TRAIN[cont_feats])
 enc = OneHotEncoder(sparse = False, handle_unknown='ignore')
-Ohe = pd.DataFrame(enc.fit_transform(X_train_cat),columns = enc.get_feature_names())
-TRAIN = TRAIN.drop(X_train_cat.columns, axis = 1)
-XY_train =  pd.concat([TRAIN, Ohe], axis  =0)
+Ohe = pd.DataFrame(enc.fit_transform(TRAIN[OHE_feats]), columns = enc.get_feature_names())
+TRAIN.drop(OHE_feats,inplace = True,  axis = 1)
+Train =  pd.concat([TRAIN, Ohe], axis  = 1)
 
-Ohe1 = pd.DataFrame(enc.transform(Y_train_cat),columns = enc.get_feature_names())
-TEST = TEST.drop(Y_train_cat.columns, axis = 1)
-XY_test  =  pd.concat([TEST, Ohe1], axis  = 0)
+TEST[cont_feats] = scaler.transform(TEST[cont_feats])
+Ohe_test = pd.DataFrame(enc.transform(TEST[OHE_feats]), columns = enc.get_feature_names())
+TEST.drop(OHE_feats, inplace = True, axis = 1)
+TEST = TEST.reset_index(drop = True)
+Test = pd.concat([TEST, Ohe_test], axis = 1)
 
-print(XY_train.select_dtypes(exclude =['int','float']).columns)
-print(XY_test.select_dtypes(exclude =['int','float']).columns)
+'''Final check
+print('----------------Test data--------')
+print(Test.describe())
+print('-------Train data--------')
+print(Train.describe())
+print('--------y values-------')
+print(Y.describe)
+'''
+
+#print("Skewness: %f" % Train['LotArea'].skew())
+Y_train = np.log(Y)
+
+'''
+skewed = []
+for i in cont_feats + ord_feats:
+    if Train[i].skew() > 1.0:
+        if i == 'IsNew':
+            pass
+        else:
+            skewed.append(i)
+    else:
+        pass
+
+#print(skewed)
+'
+log_ = ['LotFrontage', 'MasVnrArea', 'WoodDeckSF', 'TotalPorchSF']
+p_1 = ['LotArea', 'GrLivArea', 'PoolArea', 'MiscVal', 'ExterCond', 'BsmtExposure', 'BsmtFinType2', 'KitchenAbvGr', 'PoolQC']
+
+for i in log_:
+    Train[i] = np.log(Train[i])
+    Test[i] = np.log(Test[i])
+
+for i in p_1:
+    Train[i] = np.log1p(Train[i])
+    Test[i] = np.log1p(Test[i])
+
+
+    #print("Skewness: %f" % Train[i].skew())
+    #print("Skewness 1p: %f" % (np.log1p(Train[i])).skew())
+print("Skewness: %f" % Train['BsmtExposure'].skew())
+print("Skewness: %f" % Train['BsmtFinType2'].skew())
+print("Skewness: %f" % Train['KitchenAbvGr'].skew())
+print("Skewness: %f" % Train['PoolQC'].skew())
+'''
+#print(Test.isnull().values.sum())
+#print(Train.isnull().values.sum())
+
+'''Lasso optimisation
+lasso = Lasso()
+parameters = {'alpha':np.linspace(0.001, 0.11, 1000)}
+lasso_regressor = GridSearchCV(lasso, parameters, scoring = 'neg_mean_squared_error', cv = 5, n_jobs = -1, verbose = 1, refit = True)
+
+lasso_regressor.fit(Train, Y_train)
+
+print(lasso_regressor.best_params_)
+print(lasso_regressor.best_score_)
+print(lasso_regressor.scorer_)
+'''
+
+'''Lasso final use
+reg_lasso = sklearn.linear_model.Lasso(alpha = 0.001)
+X_train, X_test, Y_tr, Y_test = sklearn.model_selection.train_test_split(Train, Y_train, test_size = 0.15, random_state = 0)
+reg_lasso.fit(X_train, Y_tr)
+err_lasso =  sklearn.metrics.mean_squared_error(Y_test, reg_lasso.predict(X_test))
+print(err_lasso)
+'''
+'''Ridge optomisation
+ridge = Ridge()
+parameters = {'alpha':np.linspace(0.001, 1, 1000)}
+ridge_regressor =  GridSearchCV(ridge, parameters, scoring = 'neg_mean_squared_error', cv = 5, n_jobs = -1, verbose = 1, refit = True)
+ridge_regressor.fit(Train, Y_train)
+print(ridge_regressor.best_params_)
+print(ridge_regressor.best_score_)
+'''
+'''Ridge final use
+X_train, X_test, Y_tr, Y_test = sklearn.model_selection.train_test_split(Train, Y_train, test_size = 0.15, random_state = 0)
+reg_ridge = Ridge(alpha = 1.0)
+reg_ridge.fit(X_train, Y_tr)
+err_ridge =  sklearn.metrics.mean_squared_error(Y_test, reg_ridge.predict(X_test))
+print(err_ridge)
+'''
+
+'''Basic random forest regressor for XGBoost baseline
+X_train, X_test, Y_tr, Y_test = sklearn.model_selection.train_test_split(Train, Y_train, test_size = 0.15, random_state = 0)
+reg_forest = sklearn.ensemble.RandomForestRegressor(n_estimators = 10000, n_jobs = -1, verbose = 5)
+reg_forest.fit(X_train, Y_tr)
+err_forest = sklearn.metrics.mean_squared_error(Y_test, reg_forest.predict(X_test))
+feature_importances = pd.DataFrame(reg_forest.feature_importances_, index = X_train.columns, columns=['importance']).sort_values('importance', ascending=False)
+print(feature_importances)
+print(err_forest)
+'''
+'''combined models
+X_train, X_test, Y_tr, Y_test = sklearn.model_selection.train_test_split(Train, Y_train, test_size = 0.15)
+reg_forest = sklearn.ensemble.RandomForestRegressor(n_estimators = 10000, n_jobs = -1, verbose = 5)
+reg_forest.fit(X_train, Y_tr)
+reg_lasso = sklearn.linear_model.Lasso(alpha = 0.001)
+reg_lasso.fit(X_train, Y_tr)
+
+las_prd = reg_lasso.predict(X_test)
+forest_prd = reg_forest.predict(X_test)
+combo_prd = ((2*las_prd + forest_prd)/3)
+print(combo_prd.shape)
+err_combo = sklearn.metrics.mean_squared_error(Y_test, combo_prd)
+print(err_combo)
+'''
+
+'''XGBoost - optomisation'''
+Train['IsNew'] = Train['IsNew'].astype('int64')
+Train['NeighRich'] = Train['NeighRich'].astype('int64')
+Train['Remodeled'] = Train['Remodeled'].astype('int64')
+
+Test['IsNew'] = Test['IsNew'].astype('int64')
+Test['NeighRich'] = Test['NeighRich'].astype('int64')
+Test['Remodeled'] = Test['Remodeled'].astype('int64')
+
+
+
+'''
+xgb1 = xgb.XGBRegressor(learning_rate = 0.01, n_estimators = 10000, max_depth = 5, min_child_weight = 3, gamma = 0, subsample = 0.9, colsample_bytree = 0.43, reg_alpha = 0.0003, reg_lambda = 1, objective = 'reg:squarederror') #, verbosity = 2)
+#modelfit(xgb1, Train, Y_train)
+
+
+X_train, X_test, Y_tr, Y_test = sklearn.model_selection.train_test_split(Train, Y_train, test_size = 0.20, random_state = 0)
+xgb1.fit(X_train, Y_tr)
+xgb_prd = xgb1.predict(X_test)
+err_xgb = sklearn.metrics.mean_squared_error(Y_test, xgb_prd)
+print(err_xgb)
+'''
+'''Max_depth and min_child_weight
+
+param_test1 = {
+ 'max_depth':[3,4,5],
+ 'min_child_weight':[1,2,3]
+}
+
+gsearch1 = GridSearchCV(estimator = xgb.XGBRegressor( learning_rate =0.01, n_estimators=2825, max_depth=4, min_child_weight=2, gamma=0, subsample=0.8, colsample_bytree=0.8, objective= 'reg:squarederror', scale_pos_weight=1, seed=0),
+ param_grid = param_test1, scoring='neg_mean_squared_error',n_jobs=-1,iid=False, cv=5, verbose = 5)
+
+gsearch1.fit(Train, Y_train)
+print(gsearch1.best_score_)
+print(gsearch1.best_params_)
+#print(gsearch1.cv_results_)
+#print(gsearch1.best_index_)
+'''
+'''Gamma
+param_test3 = {'gamma':[i/10.0 for i in range(0,11)]}
+
+gsearch3 = GridSearchCV(estimator = xgb.XGBRegressor( learning_rate =0.1, n_estimators=316, max_depth=4, min_child_weight=2, gamma=0, subsample=0.8, colsample_bytree=0.8, objective= 'reg:squarederror', scale_pos_weight=1, seed=0),
+ param_grid = param_test3, scoring='neg_mean_squared_error',n_jobs=-1,iid=False, cv=5, verbose = 5)
+
+gsearch3.fit(Train, Y_train)
+print(gsearch3.best_score_)
+print(gsearch3.best_params_)
+print(gsearch3.cv_results_)
+print(gsearch3.best_index_)
+'''
+'''Sample and colsample
+param_test4 = {
+        'subsample':[i/100.0 for i in np.linspace(84, 95, 12)],
+        'colsample_bytree':[i/100.0 for i in np.linspace(34, 45, 12)]
+}
+
+
+gsearch4 = GridSearchCV(estimator = xgb.XGBRegressor( learning_rate =0.1, n_estimators=316, max_depth=4, min_child_weight=2, gamma=0, subsample=0.9, colsample_bytree=0.4, objective= 'reg:squarederror', scale_pos_weight=1, seed=0),
+ param_grid = param_test4, scoring='neg_mean_squared_error',n_jobs=-1,iid=False, cv=5, verbose = 5)
+
+gsearch4.fit(Train, Y_train)
+print(gsearch4.best_score_)
+print(gsearch4.best_params_)
+print(gsearch4.cv_results_)
+print(gsearch4.best_index_)
+'''
+
+'''Regularisation terms
+param_test5 = {
+        'reg_alpha':[i/100000.0 for i in np.linspace(25,35,11)],
+        'reg_lambda':[i/10.0 for i in np.linspace(5,15,11)]
+}
+#print(param_test5)
+
+gsearch5 = GridSearchCV(estimator = xgb.XGBRegressor( learning_rate =0.1, n_estimators=316, max_depth=4, min_child_weight=2, gamma=0, subsample=0.9, colsample_bytree=0.43, objective= 'reg:squarederror', scale_pos_weight=1, seed=0),
+ param_grid = param_test5, scoring='neg_mean_squared_error',n_jobs=-1,iid=False, cv=5, verbose = 5)
+
+gsearch5.fit(Train, Y_train)
+print(gsearch5.best_score_)
+print(gsearch5.best_params_)
+#print(gsearch5.cv_results_)
+print(gsearch5.best_index_)
+'''
+'''Final combo'''
+reg_lasso = sklearn.linear_model.Lasso(alpha = 0.001)
+#X_train, X_test, Y_tr, Y_test = sklearn.model_selection.train_test_split(Train, Y_train, test_size = 0.15, random_state = 0)
+reg_lasso.fit(Train, Y_train)
+las_prd = reg_lasso.predict(Test)
+las_price = np.exp(las_prd)
+xgb1 = xgb.XGBRegressor(learning_rate = 0.01, n_estimators = 10000, max_depth = 5, min_child_weight = 3, gamma = 0, subsample = 0.9, colsample_bytree = 0.43, reg_alpha = 0.0003, reg_lambda = 1, objective = 'reg:squarederror') #, verbosity = 2)
+xgb1.fit(Train, Y_train)
+xgb_prd =xgb1.predict(Test)
+xgb_price = np.exp(xgb_prd)
+
+combo_prd = ((2*(las_price) + xgb_price)/3)
+
+d = {'Id': test_labels,
+    'SalePrice': combo_prd}
+submission_cv = pd.DataFrame(d, columns = ['Id','SalePrice'])
+print(submission_cv.head())
+submission_cv.to_csv('submission.csv', index = False)
+
